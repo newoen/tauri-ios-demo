@@ -14,23 +14,23 @@ on:
 
 jobs:
   build-ios:
-    runs-on: macos-14
+    runs-on: macos-15
 
     steps:
-      # ---- 1. 检出代码 ----
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ---- 2. 安装 Bun ----
-      # oven-sh/setup-bun 是 Bun 官方推荐的 Action
+      - name: Select Xcode 16
+        run: sudo xcode-select -s /Applications/Xcode_16.app
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest   # 或指定 '1.2.x'
+          bun-version: latest
 
-      # ---- 3. 缓存 Bun 依赖 ----
-      # Bun 的安装缓存位于 ~/.bun/install/cache
-      # 使用 bun.lock 的哈希作为缓存键
       - name: Cache Bun dependencies
         uses: actions/cache@v4
         with:
@@ -39,79 +39,69 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-bun-
 
-      # ---- 4. 安装 Rust ----
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-ios
 
-      # ---- 5. 缓存 Rust 构建产物 ----
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: './src-tauri -> target'
           key: ios-bun-${{ hashFiles('**/Cargo.lock') }}
 
-      # ---- 6. 安装前端依赖 ----
-      # --frozen-lockfile 确保使用 bun.lock 中锁定的版本
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
-      # ---- 7. 构建前端 ----
+      - name: Show Tauri CLI version
+        run: bunx tauri --version
+
       - name: Build frontend
         run: bun run build
 
-      # ---- 8. 初始化 iOS 项目 ----
-      # 使用 bunx 执行 Tauri CLI，无需全局安装
       - name: Init Tauri iOS
         run: bunx tauri ios init
 
-      # ---- 9. 构建未签名 IPA ----
+      # 关键修复：去掉 | tee，确保退出码能正确传递
       - name: Build unsigned
         run: |
-          bunx tauri ios build --no-sign --ci 2>&1 | tee build.log || {
-            EXIT_CODE=$?
-            APP_FOUND=$(find src-tauri/gen/apple -path "*/Products/Applications/*.app" -type d | head -1)
-            if [ -n "$APP_FOUND" ]; then
-              echo "✅ .app 已生成: $APP_FOUND"
-              echo "⚠️ IPA 导出失败（预期，无签名配置）"
-            else
-              echo "❌ 构建失败，未找到 .app"
-              cat build.log
-              exit 1
-            fi
+          set -e
+          bunx tauri ios build --no-sign --ci > build.log 2>&1 || {
+            echo "=== 构建失败，输出 build.log ==="
+            cat build.log
+            exit 1
           }
+          echo "=== 构建成功 ==="
+          tail -50 build.log
 
-      # ---- 10. 手动打包 IPA ----
-      - name: Package IPA
-        id: package
+      - name: Locate .app
+        id: locate
         run: |
           APP_PATH=$(find src-tauri/gen/apple -path "*/Products/Applications/*.app" -type d | head -1)
-
           if [ -z "$APP_PATH" ]; then
-            echo "❌ 未找到 .app 文件"
+            echo "❌ 未找到 .app，列出目录结构："
+            find src-tauri/gen/apple -maxdepth 6 -type d | head -50
             exit 1
           fi
+          echo "✅ 找到 .app: $APP_PATH"
+          echo "APP_PATH=$APP_PATH" >> $GITHUB_ENV
 
-          echo "📦 打包: $APP_PATH"
-
+      - name: Package IPA
+        run: |
           WORK_DIR=$(mktemp -d)
           mkdir -p "$WORK_DIR/Payload"
-          cp -R "$APP_PATH" "$WORK_DIR/Payload/"
+          cp -R "${{ env.APP_PATH }}" "$WORK_DIR/Payload/"
 
-          # 修复权限（IPA 安装要求）
           chmod -R 755 "$WORK_DIR/Payload"
           find "$WORK_DIR/Payload" -type f -exec chmod 644 {} \;
-          APP_NAME=$(basename "$APP_PATH")
+          APP_NAME=$(basename "${{ env.APP_PATH }}")
           chmod 755 "$WORK_DIR/Payload/$APP_NAME"
 
           cd "$WORK_DIR"
           zip -r -q systeminfo-unsigned.ipa Payload/
           ls -lh systeminfo-unsigned.ipa
-
           echo "IPA_PATH=$WORK_DIR/systeminfo-unsigned.ipa" >> $GITHUB_ENV
 
-      # ---- 11. 上传产物 ----
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
