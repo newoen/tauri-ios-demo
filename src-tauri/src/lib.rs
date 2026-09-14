@@ -18,16 +18,17 @@ fn get_system_info() -> SystemInfo {
     }
 }
 
-#[cfg(target_os = "ios")]
 fn get_device_name() -> Option<String> {
-    None // 简化处理，可扩展为调用 UIDevice.current.name
-}
-
-#[cfg(not(target_os = "ios"))]
-fn get_device_name() -> Option<String> {
-    std::env::var("COMPUTERNAME")
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .ok()
+    #[cfg(not(target_os = "ios"))]
+    {
+        return std::env::var("COMPUTERNAME")
+            .or_else(|_| std::env::var("HOSTNAME"))
+            .ok();
+    }
+    #[cfg(target_os = "ios")]
+    {
+        None
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

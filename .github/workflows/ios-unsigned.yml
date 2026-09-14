@@ -38,7 +38,6 @@ jobs:
               exit 0
             fi
             if grep -q "Unable to connect to simulator" /tmp/download.log; then
-              echo "⚠️ 清理模拟器运行时后重试..."
               sudo xcrun simctl runtime delete all 2>/dev/null || true
             fi
             echo "等待 10 秒后重试..."
@@ -52,6 +51,28 @@ jobs:
         with:
           bun-version: latest
 
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+
+      # 关键：将 PATH 写入 GITHUB_ENV，后续所有步骤和子进程都会继承
+      - name: Export PATH to GITHUB_ENV
+        run: |
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          echo "$HOME/.bun/bin" >> $GITHUB_PATH
+          echo "$(dirname $(which cargo))" >> $GITHUB_PATH
+          echo "$(dirname $(which bun))" >> $GITHUB_PATH
+
+      - name: Verify toolchain
+        run: |
+          echo "PATH: $PATH"
+          echo "cargo: $(which cargo)"
+          echo "bun: $(which bun)"
+          cargo --version
+          bun --version
+          rustup target list --installed | grep aarch64-apple-ios
+
       - name: Cache Bun dependencies
         uses: actions/cache@v4
         with:
@@ -59,11 +80,6 @@ jobs:
           key: ${{ runner.os }}-bun-${{ hashFiles('**/bun.lock') }}
           restore-keys: |
             ${{ runner.os }}-bun-
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-apple-ios
 
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
@@ -74,55 +90,52 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      # 关键：先独立编译一次 Rust，确认 Rust 编译本身没问题
+      # 如果这一步失败，说明是 Rust 代码问题，与 Xcode 无关
+      - name: Pre-build Rust for iOS
+        run: |
+          cd src-tauri
+          echo "===== 独立编译 Rust iOS 目标 ====="
+          cargo build --target aarch64-apple-ios --release --verbose 2>&1 | tee /tmp/cargo-build.log
+          echo "===== Rust 编译成功 ====="
+          ls -la target/aarch64-apple-ios/release/
+
       - name: Build frontend
         run: bun run build
 
       - name: Init Tauri iOS
         run: bunx tauri ios init
 
-      # ---------- 核心修复：将 Rust/Bun 路径注入 Xcode 构建环境 ----------
       - name: Archive iOS app (unsigned)
         shell: bash
         run: |
           set -eo pipefail
 
-          # 关键修复：将 Rust 和 Bun 的路径注入 PATH，供 Xcode 的 Build Rust Code 脚本使用
+          # 再次确保 PATH 已就绪
           export PATH="$HOME/.cargo/bin:$HOME/.bun/bin:$PATH"
-          echo "当前 PATH: $PATH"
-          echo "cargo 路径: $(which cargo)"
-          echo "bun 路径: $(which bun)"
 
           cd src-tauri/gen/apple
 
           echo "===== 目录结构 ====="
           find . -maxdepth 2 -type d | sort
 
-          # 1. 定位 .xcodeproj
           XCODEPROJ=$(find . -maxdepth 1 -name "*.xcodeproj" -type d | head -1)
-          if [ -z "$XCODEPROJ" ]; then
-            echo "❌ 未找到 .xcodeproj"
-            exit 1
-          fi
+          [ -z "$XCODEPROJ" ] && { echo "❌ 未找到 .xcodeproj"; exit 1; }
           echo "✅ Xcode 项目: $XCODEPROJ"
 
-          # 2. 定位 workspace
           if [ -d "$XCODEPROJ/project.xcworkspace" ]; then
             WORKSPACE="$XCODEPROJ/project.xcworkspace"
-            echo "✅ Workspace: $WORKSPACE"
           else
             WORKSPACE="$XCODEPROJ"
-            echo "⚠️ 未找到 project.xcworkspace，直接使用 .xcodeproj: $WORKSPACE"
           fi
+          echo "✅ Workspace: $WORKSPACE"
 
-          # 3. 动态获取 scheme
-          echo "===== 可用 Scheme ====="
           xcodebuild -list -workspace "$WORKSPACE" 2>&1 | tee /tmp/scheme.log || true
           SCHEME=$(grep -A 20 "Schemes:" /tmp/scheme.log | grep -v "Schemes:" | grep -v "^$" | head -1 | xargs)
           [ -z "$SCHEME" ] && SCHEME="tauri-ios-demo_iOS"
-          echo "✅ 使用 Scheme: $SCHEME"
+          echo "✅ Scheme: $SCHEME"
 
-          # 4. 执行 archive（PATH 已导出，Xcode 子进程将继承此环境变量）
-          echo "===== 开始 Archive ====="
+          echo "===== 开始 Archive（verbose 模式，输出完整日志） ====="
           xcodebuild \
             -workspace "$WORKSPACE" \
             -scheme "$SCHEME" \
@@ -130,36 +143,32 @@ jobs:
             -sdk iphoneos \
             -destination 'generic/platform=iOS' \
             -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGN_ENTITLEMENTS="" \
-            archive 2>&1 | tee /tmp/archive.log
+            ENABLE_USER_SCRIPT_SANDBOXING=NO \
+            archive -verbose 2>&1 | tee /tmp/archive.log
 
-          # 5. 验证 archive 产物
           if [ ! -d "$RUNNER_TEMP/App.xcarchive/Products/Applications" ]; then
             echo "❌ Archive 未生成 .app"
-            tail -100 /tmp/archive.log
+            echo "===== archive.log 中所有 error 行 ====="
+            grep -n -i "error" /tmp/archive.log || true
             exit 1
           fi
-          echo "===== Archive 产物 ====="
+          echo "✅ Archive 成功"
           ls -la "$RUNNER_TEMP/App.xcarchive/Products/Applications/"
 
-      # ---------- 提取 .app ----------
       - name: Extract .app
         shell: bash
         run: |
           set -eo pipefail
           APP_PATH=$(find "$RUNNER_TEMP/App.xcarchive/Products/Applications" -name "*.app" -type d | head -1)
-          if [ -z "$APP_PATH" ]; then
-            echo "❌ 未找到 .app"
-            find "$RUNNER_TEMP/App.xcarchive" -type d | head -30
-            exit 1
-          fi
-          echo "✅ 找到 .app: $APP_PATH"
+          [ -z "$APP_PATH" ] && { echo "❌ 未找到 .app"; exit 1; }
+          echo "✅ .app: $APP_PATH"
           echo "APP_PATH=$APP_PATH" >> $GITHUB_ENV
 
-      # ---------- 打包 IPA ----------
       - name: Package IPA
         shell: bash
         run: |
@@ -176,7 +185,6 @@ jobs:
           ls -lh systeminfo-unsigned.ipa
           echo "IPA_PATH=$WORK_DIR/systeminfo-unsigned.ipa" >> $GITHUB_ENV
 
-      # ---------- 上传产物 ----------
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
@@ -185,13 +193,14 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Upload logs
+      - name: Upload all logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: build-logs
           path: |
             /tmp/archive.log
+            /tmp/cargo-build.log
             /tmp/scheme.log
             /tmp/download.log
           if-no-files-found: ignore
