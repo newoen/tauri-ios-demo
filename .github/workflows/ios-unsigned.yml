@@ -2,15 +2,6 @@ name: Build Unsigned iOS IPA (Bun)
 
 on:
   workflow_dispatch:
-    inputs:
-      build_type:
-        description: '构建类型'
-        required: true
-        default: 'release'
-        type: choice
-        options:
-          - release
-          - debug
 
 jobs:
   build-ios:
@@ -56,20 +47,15 @@ jobs:
         with:
           targets: aarch64-apple-ios
 
-      # 关键：将 PATH 写入 GITHUB_ENV，后续所有步骤和子进程都会继承
-      - name: Export PATH to GITHUB_ENV
+      - name: Add tool paths to GITHUB_PATH
         run: |
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           echo "$HOME/.bun/bin" >> $GITHUB_PATH
-          echo "$(dirname $(which cargo))" >> $GITHUB_PATH
-          echo "$(dirname $(which bun))" >> $GITHUB_PATH
 
       - name: Verify toolchain
         run: |
-          echo "PATH: $PATH"
-          echo "cargo: $(which cargo)"
-          echo "bun: $(which bun)"
           cargo --version
+          rustc --version
           bun --version
           rustup target list --installed | grep aarch64-apple-ios
 
@@ -90,38 +76,100 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
-      # 关键：先独立编译一次 Rust，确认 Rust 编译本身没问题
-      # 如果这一步失败，说明是 Rust 代码问题，与 Xcode 无关
-      - name: Pre-build Rust for iOS
-        run: |
-          cd src-tauri
-          echo "===== 独立编译 Rust iOS 目标 ====="
-          cargo build --target aarch64-apple-ios --release --verbose 2>&1 | tee /tmp/cargo-build.log
-          echo "===== Rust 编译成功 ====="
-          ls -la target/aarch64-apple-ios/release/
-
       - name: Build frontend
         run: bun run build
 
       - name: Init Tauri iOS
         run: bunx tauri ios init
 
+      # ========== 核心修复：修改 Xcode 项目，硬编码 PATH 到 Build Rust Code 脚本 ==========
+      - name: Patch Xcode project PATH
+        shell: bash
+        run: |
+          set -eo pipefail
+          cd src-tauri/gen/apple
+
+          XCODEPROJ=$(find . -maxdepth 1 -name "*.xcodeproj" -type d | head -1)
+          [ -z "$XCODEPROJ" ] && { echo "❌ 未找到 .xcodeproj"; exit 1; }
+          PBXPROJ="$XCODEPROJ/project.pbxproj"
+          echo "📝 修补文件: $PBXPROJ"
+
+          python3 - "$PBXPROJ" << 'PYEOF'
+          import re
+          import sys
+
+          path = sys.argv[1]
+          with open(path, 'r') as f:
+              content = f.read()
+
+          marker = '/* Build Rust Code */'
+          idx = content.find(marker)
+          if idx == -1:
+              print("❌ 未找到 Build Rust Code 阶段")
+              sys.exit(1)
+
+          prefix = content[:idx]
+          uuid_match = re.search(r'([A-F0-9]{24})\s*$', prefix)
+          if not uuid_match:
+              print("❌ 未找到 UUID")
+              sys.exit(1)
+          uuid = uuid_match.group(1)
+          print(f"✅ 找到 Build Rust Code 阶段: {uuid}")
+
+          block_start = content.rfind('\n', 0, uuid_match.start()) + 1
+          block_end = content.find('};', idx) + 2
+          block = content[block_start:block_end]
+
+          script_match = re.search(r'shellScript = "((?:[^"\\]|\\.)*)"', block)
+          if not script_match:
+              print("❌ 未找到 shellScript")
+              sys.exit(1)
+
+          old_script = script_match.group(1)
+          print(f"原始脚本前 200 字符: {old_script[:200]}")
+
+          # 在 shebang 之后插入 PATH 导出（\\n 和 \\" 是 pbxproj 文件里的字面转义序列）
+          path_setup = (
+              '\\n'
+              'export PATH=\\"$HOME/.cargo/bin:$HOME/.bun/bin:$HOME/.rustup/bin:/usr/local/bin:/opt/homebrew/bin:$PATH\\"\\n'
+              'echo \\"[BuildRust] PATH=$PATH\\"\\n'
+              'echo \\"[BuildRust] cargo=$(which cargo 2>&1)\\"\\n'
+              'echo \\"[BuildRust] rustc=$(which rustc 2>&1)\\"\\n'
+              'echo \\"[BuildRust] bun=$(which bun 2>&1)\\"\\n'
+          )
+
+          inserted = False
+          for shebang in ['#!/bin/bash', '#!/bin/sh', '#!/usr/bin/env bash']:
+              if old_script.startswith(shebang):
+                  new_script = shebang + path_setup + old_script[len(shebang):]
+                  inserted = True
+                  break
+          if not inserted:
+              new_script = path_setup + old_script
+
+          content = content[:script_match.start(1)] + new_script + content[script_match.end(1):]
+
+          with open(path, 'w') as f:
+              f.write(content)
+
+          print("✅ 已修补 Build Rust Code 脚本")
+          print(f"新脚本前 300 字符: {new_script[:300]}")
+          PYEOF
+
+          echo "===== 验证修补结果 ====="
+          grep -o 'shellScript = "[^"]*' "$PBXPROJ" | head -c 600 || true
+          echo ""
+
+      # ========== 归档 ==========
       - name: Archive iOS app (unsigned)
         shell: bash
         run: |
           set -eo pipefail
-
-          # 再次确保 PATH 已就绪
           export PATH="$HOME/.cargo/bin:$HOME/.bun/bin:$PATH"
-
           cd src-tauri/gen/apple
-
-          echo "===== 目录结构 ====="
-          find . -maxdepth 2 -type d | sort
 
           XCODEPROJ=$(find . -maxdepth 1 -name "*.xcodeproj" -type d | head -1)
           [ -z "$XCODEPROJ" ] && { echo "❌ 未找到 .xcodeproj"; exit 1; }
-          echo "✅ Xcode 项目: $XCODEPROJ"
 
           if [ -d "$XCODEPROJ/project.xcworkspace" ]; then
             WORKSPACE="$XCODEPROJ/project.xcworkspace"
@@ -135,7 +183,8 @@ jobs:
           [ -z "$SCHEME" ] && SCHEME="tauri-ios-demo_iOS"
           echo "✅ Scheme: $SCHEME"
 
-          echo "===== 开始 Archive（verbose 模式，输出完整日志） ====="
+          echo "===== 开始 Archive ====="
+          set +e
           xcodebuild \
             -workspace "$WORKSPACE" \
             -scheme "$SCHEME" \
@@ -149,12 +198,24 @@ jobs:
             CODE_SIGN_IDENTITY="" \
             CODE_SIGN_ENTITLEMENTS="" \
             ENABLE_USER_SCRIPT_SANDBOXING=NO \
-            archive -verbose 2>&1 | tee /tmp/archive.log
+            archive 2>&1 | tee /tmp/archive.log
+          EXIT_CODE=${PIPESTATUS[0]}
+          set -e
+
+          if [ $EXIT_CODE -ne 0 ]; then
+            echo "===== xcodebuild 退出码: $EXIT_CODE ====="
+            echo "===== BuildRust 相关日志 ====="
+            grep -A 30 "BuildRust" /tmp/archive.log || true
+            echo "===== 所有 error 行 ====="
+            grep -n -i "error:" /tmp/archive.log | head -30 || true
+            echo "===== 日志尾部 100 行 ====="
+            tail -100 /tmp/archive.log
+            exit 1
+          fi
 
           if [ ! -d "$RUNNER_TEMP/App.xcarchive/Products/Applications" ]; then
             echo "❌ Archive 未生成 .app"
-            echo "===== archive.log 中所有 error 行 ====="
-            grep -n -i "error" /tmp/archive.log || true
+            tail -100 /tmp/archive.log
             exit 1
           fi
           echo "✅ Archive 成功"
@@ -193,14 +254,13 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Upload all logs
+      - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: build-logs
           path: |
             /tmp/archive.log
-            /tmp/cargo-build.log
             /tmp/scheme.log
             /tmp/download.log
           if-no-files-found: ignore
