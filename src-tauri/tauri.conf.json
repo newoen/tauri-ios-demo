@@ -34,7 +34,7 @@
       "icons/icon.ico"
     ],
     "iOS": {
-      "developmentTeam": "",
+      "developmentTeam": "12345",
       "bundleVersion": "1"
     }
   }
