@@ -29,7 +29,27 @@ jobs:
           xcodebuild -version
 
       - name: Download iOS Platform
-        run: xcodebuild -downloadPlatform iOS
+        run: |
+          xcrun simctl list > /dev/null 2>&1 || true
+
+          for i in 1 2 3; do
+            echo "=== 第 $i 次尝试下载 iOS 平台 ==="
+            if sudo xcodebuild -downloadPlatform iOS 2>&1 | tee /tmp/download.log; then
+              echo "✅ iOS 平台下载成功"
+              exit 0
+            fi
+
+            if grep -q "Unable to connect to simulator" /tmp/download.log; then
+              echo "⚠️ 检测到模拟器连接错误，清理模拟器运行时后重试..."
+              sudo xcrun simctl runtime delete all 2>/dev/null || true
+            fi
+
+            echo "等待 10 秒后重试..."
+            sleep 10
+          done
+
+          echo "❌ iOS 平台下载失败，已重试 3 次"
+          exit 1
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -64,27 +84,11 @@ jobs:
       - name: Init Tauri iOS
         run: bunx tauri ios init
 
-      # 关键步骤：列出可用 scheme，确认名称
-      - name: List Xcode schemes
-        run: |
-          cd src-tauri/gen/apple
-          echo "=== Workspace 列表 ==="
-          ls -la
-          echo "=== Scheme 列表 ==="
-          xcodebuild -list -workspace project.xcworkspace 2>&1 || true
-
-      # 关键修复：手动执行 xcodebuild archive，指定 destination
       - name: Archive unsigned .xcarchive
         run: |
           set -e
           cd src-tauri/gen/apple
-
-          # scheme 名称 = Cargo package name + "_iOS"
           SCHEME="tauri-ios-demo_iOS"
-
-          echo "使用 scheme: $SCHEME"
-          echo "Archive 路径: $RUNNER_TEMP/App.xcarchive"
-
           xcodebuild -workspace project.xcworkspace \
             -scheme "$SCHEME" \
             -configuration Release \
@@ -95,38 +99,33 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             archive 2>&1 | tee $RUNNER_TEMP/archive.log || {
-              echo "=== archive 失败，完整日志 ==="
+              echo "=== archive 失败 ==="
               cat $RUNNER_TEMP/archive.log
               exit 1
             }
-
           echo "=== Archive 成功 ==="
           ls -la "$RUNNER_TEMP/App.xcarchive/Products/Applications/"
 
-      # 从 .xcarchive 提取 .app
       - name: Extract .app
         run: |
           APP_PATH=$(find "$RUNNER_TEMP/App.xcarchive/Products/Applications" -name "*.app" -type d | head -1)
           if [ -z "$APP_PATH" ]; then
-            echo "❌ 未找到 .app，列出 archive 内容："
+            echo "❌ 未找到 .app"
             find "$RUNNER_TEMP/App.xcarchive" -type d | head -30
             exit 1
           fi
           echo "✅ 找到 .app: $APP_PATH"
           echo "APP_PATH=$APP_PATH" >> $GITHUB_ENV
 
-      # 打包 IPA
       - name: Package IPA
         run: |
           WORK_DIR=$(mktemp -d)
           mkdir -p "$WORK_DIR/Payload"
           cp -R "$APP_PATH" "$WORK_DIR/Payload/"
-
           chmod -R 755 "$WORK_DIR/Payload"
           find "$WORK_DIR/Payload" -type f -exec chmod 644 {} \;
           APP_NAME=$(basename "$APP_PATH")
           chmod 755 "$WORK_DIR/Payload/$APP_NAME"
-
           cd "$WORK_DIR"
           zip -r -q systeminfo-unsigned.ipa Payload/
           ls -lh systeminfo-unsigned.ipa
@@ -147,5 +146,6 @@ jobs:
           name: build-logs
           path: |
             $RUNNER_TEMP/archive.log
+            /tmp/download.log
           if-no-files-found: ignore
           retention-days: 7
