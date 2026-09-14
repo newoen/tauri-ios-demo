@@ -1,0 +1,22 @@
+[package]
+name = "tauri-ios-demo"
+version = "1.0.0"
+description = "iOS 系统信息查看器"
+authors = ["you"]
+edition = "2021"
+
+[lib]
+name = "tauri_ios_demo_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["protocol-asset"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(target_os = "ios")'.dependencies]
+objc2 = "0.5"
+objc2-foundation = { version = "0.2", features = ["NSString"] }
