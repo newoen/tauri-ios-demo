@@ -1,40 +1,127 @@
-      - name: Archive unsigned .xcarchive
+name: Build Unsigned iOS IPA (Bun)
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: '构建类型'
+        required: true
+        default: 'release'
+        type: choice
+        options:
+          - release
+          - debug
+
+jobs:
+  build-ios:
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode 16
         run: |
-          set -e
+          sudo xcode-select -s /Applications/Xcode_16.app 2>/dev/null \
+            || sudo xcode-select -s /Applications/Xcode_16.4.app 2>/dev/null \
+            || sudo xcode-select -s /Applications/Xcode_16.3.app 2>/dev/null \
+            || { echo "❌ 未找到 Xcode 16"; ls /Applications/ | grep Xcode; exit 1; }
+          xcodebuild -version
+
+      - name: Download iOS Platform
+        run: |
+          xcrun simctl list > /dev/null 2>&1 || true
+          for i in 1 2 3; do
+            echo "=== 第 $i 次尝试下载 iOS 平台 ==="
+            if sudo xcodebuild -downloadPlatform iOS 2>&1 | tee /tmp/download.log; then
+              echo "✅ iOS 平台下载成功"
+              exit 0
+            fi
+            if grep -q "Unable to connect to simulator" /tmp/download.log; then
+              echo "⚠️ 清理模拟器运行时后重试..."
+              sudo xcrun simctl runtime delete all 2>/dev/null || true
+            fi
+            echo "等待 10 秒后重试..."
+            sleep 10
+          done
+          echo "❌ iOS 平台下载失败"
+          exit 1
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Cache Bun dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-bun-${{ hashFiles('**/bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+          key: ios-bun-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build frontend
+        run: bun run build
+
+      - name: Init Tauri iOS
+        run: bunx tauri ios init
+
+      # ---------- 核心修复：定位 workspace、scheme，然后 archive ----------
+      - name: Archive iOS app (unsigned)
+        shell: bash
+        run: |
+          # 关键：让管道中的失败也能被 set -e 捕获
+          set -eo pipefail
+
           cd src-tauri/gen/apple
 
-          # 先列出目录，确认实际生成的结构
-          echo "=== 当前目录结构 ==="
-          find . -maxdepth 3 -name "*.xcodeproj" -o -name "*.xcworkspace" | sort
+          echo "===== 目录结构 ====="
+          find . -maxdepth 2 -type d | sort
 
-          # 动态查找 .xcodeproj 和其内部的 project.xcworkspace
+          # 1. 定位 .xcodeproj
           XCODEPROJ=$(find . -maxdepth 1 -name "*.xcodeproj" -type d | head -1)
           if [ -z "$XCODEPROJ" ]; then
-            echo "❌ 未找到 .xcodeproj 目录"
-            ls -la
+            echo "❌ 未找到 .xcodeproj"
             exit 1
           fi
+          echo "✅ Xcode 项目: $XCODEPROJ"
 
-          WORKSPACE="$XCODEPROJ/project.xcworkspace"
-          if [ ! -d "$WORKSPACE" ]; then
-            echo "❌ 未找到 workspace: $WORKSPACE"
-            find "$XCODEPROJ" -maxdepth 3 -type d
-            exit 1
-          fi
-
-          echo "✅ 使用 workspace: $WORKSPACE"
-
-          # 动态查找 scheme 名称
-          SCHEME=$(xcodebuild -list -workspace "$WORKSPACE" 2>/dev/null | grep -A 10 "Schemes:" | grep -v "Schemes:" | head -1 | xargs)
-          if [ -z "$SCHEME" ]; then
-            SCHEME="tauri-ios-demo_iOS"
-            echo "⚠️ 未能自动获取 scheme，使用默认: $SCHEME"
+          # 2. 定位 workspace（优先用 .xcworkspace，没有就用 .xcodeproj）
+          if [ -d "$XCODEPROJ/project.xcworkspace" ]; then
+            WORKSPACE="$XCODEPROJ/project.xcworkspace"
+            echo "✅ Workspace: $WORKSPACE"
           else
-            echo "✅ 找到 scheme: $SCHEME"
+            WORKSPACE="$XCODEPROJ"
+            echo "⚠️ 未找到 project.xcworkspace，直接使用 .xcodeproj: $WORKSPACE"
           fi
 
-          # 执行 archive
-          xcodebuild -workspace "$WORKSPACE" \
+          # 3. 动态获取 scheme
+          echo "===== 可用 Scheme ====="
+          xcodebuild -list -workspace "$WORKSPACE" 2>&1 | tee /tmp/scheme.log || true
+
+          # 优先用 tauri-ios-demo_iOS，找不到就取列表中的第一个
+          SCHEME=$(grep -A 20 "Schemes:" /tmp/scheme.log | grep -v "Schemes:" | grep -v "^$" | head -1 | xargs)
+          [ -z "$SCHEME" ] && SCHEME="tauri-ios-demo_iOS"
+          echo "✅ 使用 Scheme: $SCHEME"
+
+          # 4. 执行 archive
+          echo "===== 开始 Archive ====="
+          xcodebuild \
+            -workspace "$WORKSPACE" \
             -scheme "$SCHEME" \
             -configuration Release \
             -sdk iphoneos \
@@ -43,11 +130,72 @@
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
-            archive 2>&1 | tee $RUNNER_TEMP/archive.log || {
-              echo "=== archive 失败，完整日志 ==="
-              cat $RUNNER_TEMP/archive.log
-              exit 1
-            }
+            CODE_SIGN_ENTITLEMENTS="" \
+            archive 2>&1 | tee /tmp/archive.log
 
-          echo "=== Archive 成功 ==="
+          # 5. 验证 archive 产物
+          if [ ! -d "$RUNNER_TEMP/App.xcarchive/Products/Applications" ]; then
+            echo "❌ Archive 未生成 .app"
+            echo "===== Archive 日志尾部 ====="
+            tail -100 /tmp/archive.log
+            exit 1
+          fi
+
+          echo "===== Archive 产物 ====="
           ls -la "$RUNNER_TEMP/App.xcarchive/Products/Applications/"
+
+      # ---------- 提取 .app ----------
+      - name: Extract .app
+        shell: bash
+        run: |
+          set -eo pipefail
+
+          APP_PATH=$(find "$RUNNER_TEMP/App.xcarchive/Products/Applications" -name "*.app" -type d | head -1)
+          if [ -z "$APP_PATH" ]; then
+            echo "❌ 未找到 .app"
+            find "$RUNNER_TEMP/App.xcarchive" -type d | head -30
+            exit 1
+          fi
+          echo "✅ 找到 .app: $APP_PATH"
+          echo "APP_PATH=$APP_PATH" >> $GITHUB_ENV
+
+      # ---------- 打包 IPA ----------
+      - name: Package IPA
+        shell: bash
+        run: |
+          set -eo pipefail
+
+          WORK_DIR=$(mktemp -d)
+          mkdir -p "$WORK_DIR/Payload"
+          cp -R "$APP_PATH" "$WORK_DIR/Payload/"
+
+          chmod -R 755 "$WORK_DIR/Payload"
+          find "$WORK_DIR/Payload" -type f -exec chmod 644 {} \;
+          APP_NAME=$(basename "$APP_PATH")
+          chmod 755 "$WORK_DIR/Payload/$APP_NAME"
+
+          cd "$WORK_DIR"
+          zip -r -q systeminfo-unsigned.ipa Payload/
+          ls -lh systeminfo-unsigned.ipa
+          echo "IPA_PATH=$WORK_DIR/systeminfo-unsigned.ipa" >> $GITHUB_ENV
+
+      # ---------- 上传产物 ----------
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-unsigned-ipa
+          path: ${{ env.IPA_PATH }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            /tmp/archive.log
+            /tmp/scheme.log
+            /tmp/download.log
+          if-no-files-found: ignore
+          retention-days: 7
