@@ -80,12 +80,17 @@ jobs:
       - name: Init Tauri iOS
         run: bunx tauri ios init
 
-      # ---------- 核心修复：定位 workspace、scheme，然后 archive ----------
+      # ---------- 核心修复：将 Rust/Bun 路径注入 Xcode 构建环境 ----------
       - name: Archive iOS app (unsigned)
         shell: bash
         run: |
-          # 关键：让管道中的失败也能被 set -e 捕获
           set -eo pipefail
+
+          # 关键修复：将 Rust 和 Bun 的路径注入 PATH，供 Xcode 的 Build Rust Code 脚本使用
+          export PATH="$HOME/.cargo/bin:$HOME/.bun/bin:$PATH"
+          echo "当前 PATH: $PATH"
+          echo "cargo 路径: $(which cargo)"
+          echo "bun 路径: $(which bun)"
 
           cd src-tauri/gen/apple
 
@@ -100,7 +105,7 @@ jobs:
           fi
           echo "✅ Xcode 项目: $XCODEPROJ"
 
-          # 2. 定位 workspace（优先用 .xcworkspace，没有就用 .xcodeproj）
+          # 2. 定位 workspace
           if [ -d "$XCODEPROJ/project.xcworkspace" ]; then
             WORKSPACE="$XCODEPROJ/project.xcworkspace"
             echo "✅ Workspace: $WORKSPACE"
@@ -112,13 +117,11 @@ jobs:
           # 3. 动态获取 scheme
           echo "===== 可用 Scheme ====="
           xcodebuild -list -workspace "$WORKSPACE" 2>&1 | tee /tmp/scheme.log || true
-
-          # 优先用 tauri-ios-demo_iOS，找不到就取列表中的第一个
           SCHEME=$(grep -A 20 "Schemes:" /tmp/scheme.log | grep -v "Schemes:" | grep -v "^$" | head -1 | xargs)
           [ -z "$SCHEME" ] && SCHEME="tauri-ios-demo_iOS"
           echo "✅ 使用 Scheme: $SCHEME"
 
-          # 4. 执行 archive
+          # 4. 执行 archive（PATH 已导出，Xcode 子进程将继承此环境变量）
           echo "===== 开始 Archive ====="
           xcodebuild \
             -workspace "$WORKSPACE" \
@@ -136,11 +139,9 @@ jobs:
           # 5. 验证 archive 产物
           if [ ! -d "$RUNNER_TEMP/App.xcarchive/Products/Applications" ]; then
             echo "❌ Archive 未生成 .app"
-            echo "===== Archive 日志尾部 ====="
             tail -100 /tmp/archive.log
             exit 1
           fi
-
           echo "===== Archive 产物 ====="
           ls -la "$RUNNER_TEMP/App.xcarchive/Products/Applications/"
 
@@ -149,7 +150,6 @@ jobs:
         shell: bash
         run: |
           set -eo pipefail
-
           APP_PATH=$(find "$RUNNER_TEMP/App.xcarchive/Products/Applications" -name "*.app" -type d | head -1)
           if [ -z "$APP_PATH" ]; then
             echo "❌ 未找到 .app"
@@ -164,16 +164,13 @@ jobs:
         shell: bash
         run: |
           set -eo pipefail
-
           WORK_DIR=$(mktemp -d)
           mkdir -p "$WORK_DIR/Payload"
           cp -R "$APP_PATH" "$WORK_DIR/Payload/"
-
           chmod -R 755 "$WORK_DIR/Payload"
           find "$WORK_DIR/Payload" -type f -exec chmod 644 {} \;
           APP_NAME=$(basename "$APP_PATH")
           chmod 755 "$WORK_DIR/Payload/$APP_NAME"
-
           cd "$WORK_DIR"
           zip -r -q systeminfo-unsigned.ipa Payload/
           ls -lh systeminfo-unsigned.ipa
